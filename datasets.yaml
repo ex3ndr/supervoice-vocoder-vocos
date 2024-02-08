@@ -1,0 +1,6 @@
+datasets:
+  - libritts-r
+  - libritts-r@clean-100
+  - libritts-r@clean-360
+  - libritts-r@other-500
+  - ptdb-tug
