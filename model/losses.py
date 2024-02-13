@@ -40,7 +40,7 @@ class GeneratorLoss(nn.Module):
             gen_losses.append(l)
             loss += l
 
-        return loss, 
+        return loss, gen_losses
 
 #
 # Discriminator Loss module. Calculates the loss for the discriminator based on real and generated outputs.

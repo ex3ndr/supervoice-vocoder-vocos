@@ -69,7 +69,7 @@ def resampler(from_sample_rate, to_sample_rate, device=None):
 #
     
 def istft(x, *, n_fft, hop_length, win_length):
-    return torch.istft(x, n_fft=n_fft, hop_length=hop_length, win_length=win_length, center=True)
+    return torch.istft(x, n_fft=n_fft, hop_length=hop_length, win_length=win_length, center=True, length=x.shape[-1] * hop_length)
 
 #
 # Padding calculation for kernel size and dilation

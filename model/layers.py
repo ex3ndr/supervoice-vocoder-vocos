@@ -59,11 +59,15 @@ class SpectogramLayer(nn.Module):
             hop_length=self.n_hop_length, 
             win_length=self.n_hop_length * 4,
             window=window, 
-            return_complex=False
+            center=True,
+            return_complex = True
         )
 
-        # Compute magnitudes using squared value
-        magnitudes = torch.sum((stft ** 2), dim=-1)[..., :-1]
+        # Compute magnitudes (|a + ib| = sqrt(a^2 + b^2)) instead of power spectrum (|a + ib|^2 = a^2 + b^2)
+        # because magnitude and phase is linear to the input, while power spectrum is quadratic to the input
+        # and the magnitude is easier to learn for vocoder
+        # power = stft[..., :-1].abs() ** 2
+        magnitudes = stft[..., :-1].abs()
 
         # Mel Log Bank
         mel_filters = melscale_fbanks(self.n_mels, self.n_fft, 0, self.sample_rate / 2, self.sample_rate, x.device)

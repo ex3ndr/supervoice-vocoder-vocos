@@ -7,6 +7,7 @@ from glob import glob
 from pathlib import Path
 import random
 import itertools
+import shutil
 
 # ML
 import torch
@@ -25,12 +26,12 @@ from model.dataset import SimpleAudioDataset
 # Parameters
 #
 
-train_experiment = "pre"
+train_experiment = "new_mel_2"
 train_project = "supervoice-vocoder"
 train_auto_resume = True
-train_segment_size = 16000
+train_segment_size = 24000
 train_learning_rate = 2e-4
-train_batch_size = 64 # Per GPU
+train_batch_size = 32 # Per GPU
 train_steps = 1000000
 train_loader_workers = 4
 train_save_every = 1000
@@ -57,8 +58,7 @@ def main():
     accelerator.print("Loading dataset...")
 
     # Train Files
-    # train_files = glob("external_datasets/libritts-r-clean-100/*/*/*.wav") + glob("external_datasets/libritts-r-clean-360/*/*/*.wav") + glob("external_datasets/libritts-r-other-500/*/*/*.wav") + glob("external_datasets/ptdb-tug/SPEECH DATA/FEMALE/MIC/*.wav") + glob("external_datasets/ptdb-tug/SPEECH DATA/MALE/MIC/*.wav")
-    train_files = glob("external_datasets/libritts-r-clean-100/*/*/*.wav")
+    train_files = glob("external_datasets/libritts-r-clean-100/*/*/*.wav") + glob("external_datasets/libritts-r-clean-360/*/*/*.wav") + glob("external_datasets/libritts-r-other-500/*/*/*.wav") + glob("external_datasets/ptdb-tug/SPEECH DATA/FEMALE/MIC/*.wav") + glob("external_datasets/ptdb-tug/SPEECH DATA/MALE/MIC/*.wav")
     train_files.sort()
     random.shuffle(train_files)
 
@@ -98,7 +98,7 @@ def main():
     scheduler_d = torch.optim.lr_scheduler.CosineAnnealingLR(optim_d, T_max=train_steps)
 
     # Accelerate
-    vocoder, multiperioddisc, multiresddisc, optim_g, optim_d, scheduler_g, scheduler_d, train_loader = accelerator.prepare(vocoder, multiperioddisc, multiresddisc, optim_g, optim_d, scheduler_g, scheduler_d, train_loader)
+    vocoder, multiperioddisc, multiresddisc, optim_g, optim_d, scheduler_g, scheduler_d, train_loader, test_loader = accelerator.prepare(vocoder, multiperioddisc, multiresddisc, optim_g, optim_d, scheduler_g, scheduler_d, train_loader, test_loader)
     train_cycle = cycle(train_loader)
     hps = {
         "segment_size": train_segment_size, 
@@ -114,7 +114,47 @@ def main():
 
     # Save/Load
     def save():
-        pass
+
+        # Save step checkpoint
+        fname = str(output_dir / f"{train_experiment}.pt")
+        fname_step = str(output_dir / f"{train_experiment}.{steps}.pt")
+        torch.save({
+
+            # Model
+            'vocoder': accelerator.get_state_dict(vocoder), 
+            "mpd": accelerator.get_state_dict(multiperioddisc),
+            "msd": accelerator.get_state_dict(multiresddisc),
+
+            # Optimizer
+            'steps': steps,
+            'optimizer_g': optim_g.state_dict(), 
+            'optimizer_d': optim_d.state_dict(), 
+            'scheduler_g': scheduler_g.state_dict(),
+            'scheduler_d': scheduler_d.state_dict(),
+
+        },  fname_step)
+
+        # Overwrite main checkpoint
+        shutil.copyfile(fname_step, fname)
+
+    # Load
+    if train_auto_resume:
+        if (output_dir / f"{train_experiment}.pt").exists():
+            accelerator.print("Resuming training...")
+
+            checkpoint = torch.load(str(output_dir / f"{train_experiment}.pt"), map_location="cpu")
+
+            # Model
+            accelerator.unwrap_model(vocoder).load_state_dict(checkpoint['vocoder'])
+            accelerator.unwrap_model(multiperioddisc).load_state_dict(checkpoint['mpd'])
+            accelerator.unwrap_model(multiresddisc).load_state_dict(checkpoint['msd'])
+
+            # Optimizer
+            optim_g.load_state_dict(checkpoint['optimizer_g'])
+            optim_d.load_state_dict(checkpoint['optimizer_d'])
+            scheduler_g.load_state_dict(checkpoint['scheduler_g'])
+            scheduler_d.load_state_dict(checkpoint['scheduler_d'])
+            steps = checkpoint['steps']
 
     # Train step
     def train_step():
@@ -127,7 +167,8 @@ def main():
 
         # Generate
         audio_res = resampler(24000, 16000, audio.device)(audio)
-        audio_hat = vocoder(spec(audio_res)) # Need to resample from 24k to 16k
+        audio_res_spec = spec(audio_res)
+        audio_hat = vocoder(audio_res_spec) # Need to resample from 24k to 16k
 
         # Adding a channel dimension
         audio_hat = audio_hat.unsqueeze(1)
@@ -155,6 +196,8 @@ def main():
         # Backward pass
         optim_d.zero_grad()
         accelerator.backward(loss)
+        grad_norm_mpd = accelerator.clip_grad_norm_(multiperioddisc.parameters(), 1000.)
+        grad_norm_msd = accelerator.clip_grad_norm_(multiresddisc.parameters(), 1000.)
         optim_d.step()
 
         #
@@ -162,7 +205,7 @@ def main():
         #
 
         # Reconstruciton loss
-        mel_loss = melspec_loss(audio, audio_hat) * train_mel_loss_factor
+        mel_loss = melspec_loss(audio, audio_hat)
 
         # Discriminator-based losses
         _, gen_score_mp, fmap_rs_mp, fmap_gs_mp = multiperioddisc(y=audio, y_hat=audio_hat)
@@ -178,6 +221,7 @@ def main():
         loss_gen = (loss_gen_mp + train_mrd_loss_coeff * loss_gen_mrd + loss_fm_mp + train_mrd_loss_coeff * loss_fm_mrd + train_mel_loss_factor * mel_loss)
         optim_g.zero_grad()
         accelerator.backward(loss_gen)
+        grad_norm_g = accelerator.clip_grad_norm_(vocoder.parameters(), 1000.)
         optim_g.step()
 
         #
@@ -187,14 +231,14 @@ def main():
         scheduler_d.step()
         scheduler_g.step()
 
-        return loss, loss_gen, mel_loss, loss_gen_mp, loss_gen_mrd, loss_fm_mp, loss_fm_mrd, loss_mp, loss_mrd
+        return loss.item(), loss_gen.item(), mel_loss.item(), loss_gen_mp.item(), loss_gen_mrd.item(), loss_fm_mp.item(), loss_fm_mrd.item(), loss_mp.item(), loss_mrd.item(), grad_norm_mpd, grad_norm_msd, grad_norm_g
 
     # Train Loop
     accelerator.print("Training started at step", steps)
     while steps < train_steps:
 
         # Train step
-        loss, loss_gen, mel_loss, loss_gen_mp, loss_gen_mrd, loss_fm_mp, loss_fm_mrd, loss_mp, loss_mrd = train_step()
+        loss, loss_gen, mel_loss, loss_gen_mp, loss_gen_mrd, loss_fm_mp, loss_fm_mrd, loss_mp, loss_mrd, grad_norm_mpd, grad_norm_msd, grad_norm_g = train_step()
 
         # Update step
         steps = steps + 1
@@ -203,36 +247,57 @@ def main():
         accelerator.wait_for_everyone()
 
         # Evaluate
-        # if (steps % train_evaluate_every == 0):
-        #     if accelerator.is_main_process:
-        #         accelerator.print("Evaluating...")
-        #     with torch.inference_mode():      
-        #         generator.eval()
-        #         losses = []
-        #         for test_batch in test_loader:
-        #             audio, spec = test_batch
-        #             audio = audio.unsqueeze(1)
-        #             y_g_hat = generator(spec)
-        #             y_g_hat_mel = spectogram(y_g_hat.squeeze(1), vocoder_mel_fft, vocoder_mel_n, vocoder_mel_hop_size, vocoder_mel_win_size, vocoder_sample_rate)
-        #             loss_mel = F.l1_loss(spec, y_g_hat_mel) * 45
-        #             gathered = accelerator.gather(loss_mel).cpu()
-        #             if len(gathered.shape) == 0:
-        #                 gathered = gathered.unsqueeze(0)
-        #             losses += gathered.tolist()
-        #         if accelerator.is_main_process:
-        #             loss = torch.tensor(losses).mean()
-        #             accelerator.log({"loss_mel_test": loss}, step=steps)
-        #             accelerator.print(f"Evaluation Loss: {loss}")
+        if (steps % train_evaluate_every == 0):
+            if accelerator.is_main_process:
+                accelerator.print("Evaluating...")
+            with torch.inference_mode():      
+                vocoder.eval()
+                losses = []
+                for test_batch in test_loader:
+                    audio = test_batch
+                    audio_res = resampler(24000, 16000, audio.device)(audio)
+                    audio_res_spec = spec(audio_res)
+                    audio_hat = vocoder(audio_res_spec)
+                    audio_hat = audio_hat.unsqueeze(1)
+                    audio = audio.unsqueeze(1)
+                    mel_loss = melspec_loss(audio, audio_hat)
+                    gathered = accelerator.gather(mel_loss).cpu()
+                    if len(gathered.shape) == 0:
+                        gathered = gathered.unsqueeze(0)
+                    losses += gathered.tolist()
+                if accelerator.is_main_process:
+                    eval_loss = torch.tensor(losses).mean()
+                    accelerator.log({"loss_mel_test": eval_loss}, step=steps)
+                    accelerator.print(f"Evaluation Loss: {eval_loss}")
 
         # Log
         if accelerator.is_main_process and (steps % train_log_every == 0):
             accelerator.print(f"Step {steps}: DLoss: {loss}, GLoss: {loss_gen}, MelLoss: {mel_loss}, GLossMP: {loss_gen_mp}, GLossMRD: {loss_gen_mrd}, FMLossMP: {loss_fm_mp}, FMLossMRD: {loss_fm_mrd}, DLossMP: {loss_mp}, DLossMRD: {loss_mrd}")
-            accelerator.log({ 'dloss': loss, 'gloss': loss_gen, 'mel_loss': mel_loss, 'gloss_mp': loss_gen_mp, 'gloss_mrd': loss_gen_mrd, 'fmloss_mp': loss_fm_mp, 'fmloss_mrd': loss_fm_mrd, 'dloss_mp': loss_mp, 'dloss_mrd': loss_mrd }, step=steps)
+            accelerator.log({ 
+                'dloss': loss, 
+                'gloss': loss_gen, 
+                'mel_loss': mel_loss, 
+                'gloss_mp': loss_gen_mp, 
+                'gloss_mrd': loss_gen_mrd, 
+                'fmloss_mp': loss_fm_mp, 
+                'fmloss_mrd': loss_fm_mrd, 
+                'dloss_mp': loss_mp, 
+                'dloss_mrd': loss_mrd,
+                'grad_norm_msd': grad_norm_msd,
+                'grad_norm_mpd': grad_norm_mpd,
+                'grad_norm_g': grad_norm_g
+            }, step=steps)
 
         # Save 
         if accelerator.is_main_process and (steps % train_save_every == 0):
             save()
-        
+
+    # End training
+    if accelerator.is_main_process:
+        accelerator.print("Finishing training...")
+        save()
+    accelerator.end_training()
+    accelerator.print('✨ Training complete!')
 
 
 if __name__ == "__main__":
